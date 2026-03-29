@@ -4,16 +4,17 @@ training_config:
   model_save_interval: 100
   batch_size: 64
   num_epochs: 1
-  max_steps: 100
-  learning_rate: 0.0003
-  weight_decay: 0.01
-  momentum: 0.9
+  max_steps: 1000
   use_moreh_adamw: true
   use_sgd: false
+  learning_rate: 0.0003
+  weight_decay: 0.1
+  momentum: 0.9
   use_sgd_fused: false
   use_kahan_summation: false
   use_clip_grad_norm: false
   clip_grad_norm_max_norm: 1.0
+  warmup_steps: 10
   tokenizer_type: "char"
   data_path: "data/shakespeare.txt"
   model_config: "configs/model_configs/nanogpt.yaml"

@@ -15,6 +15,7 @@
 #include "core/distributed/distributed.hpp"
 #include "core/distributed/socket_manager.hpp"
 #include "core/tt_tensor_utils.hpp"
+#include "csv_logger.hpp"
 #include "datasets/dataloader.hpp"
 #include "datasets/in_memory_token_dataset.hpp"
 #include "datasets/utils.hpp"
@@ -29,6 +30,8 @@
 #include "optimizers/adamw.hpp"
 #include "optimizers/no_op.hpp"
 #include "optimizers/remote_optimizer.hpp"
+#include "optimizers/sgd.hpp"
+#include "optimizers/sgd_fused.hpp"
 #include "tokenizers/char_tokenizer.hpp"
 #include "ttnn_fixed/distributed/tt_metal.hpp"
 #include "ttnn_fixed/trivial_ttnn_ops.hpp"
@@ -98,8 +101,11 @@ struct TrainingConfig {
     uint32_t max_steps = 5000;
     float learning_rate = 3e-4F;
     float weight_decay = 1e-2F;
+    float momentum = 1e-2F;
     bool use_no_op = false;
     bool use_moreh_adamw = false;
+    bool use_sgd = false;
+    bool use_sgd_fused = false;
     // works only for AdamW
     bool use_kahan_summation = false;
     // accumulate batches for gradient update
@@ -110,6 +116,7 @@ struct TrainingConfig {
     std::string tokenizer_type = "char";
     bool use_clip_grad_norm = false;
     float clip_grad_norm_max_norm = 1.0F;
+    uint32_t warmup_steps = 3;
 };
 
 TrainingConfig parse_config(const YAML::Node &yaml_config) {
@@ -123,8 +130,11 @@ TrainingConfig parse_config(const YAML::Node &yaml_config) {
     config.max_steps = training_config["max_steps"].as<uint32_t>();
     config.learning_rate = training_config["learning_rate"].as<float>();
     config.weight_decay = training_config["weight_decay"].as<float>();
+    config.momentum = training_config["momentum"].as<float>();
     config.use_no_op = training_config["use_no_op"].as<bool>(config.use_no_op);
     config.use_moreh_adamw = training_config["use_moreh_adamw"].as<bool>(config.use_moreh_adamw);
+    config.use_sgd = training_config["use_sgd"].as<bool>(config.use_sgd);
+    config.use_sgd_fused = training_config["use_sgd_fused"].as<bool>(config.use_sgd_fused);
     config.use_kahan_summation = training_config["use_kahan_summation"].as<bool>(config.use_kahan_summation);
     config.gradient_accumulation_steps =
         training_config["gradient_accumulation_steps"].as<uint32_t>(config.gradient_accumulation_steps);
@@ -135,6 +145,7 @@ TrainingConfig parse_config(const YAML::Node &yaml_config) {
     config.clip_grad_norm_max_norm =
         training_config["clip_grad_norm_max_norm"].as<float>(config.clip_grad_norm_max_norm);
     config.tokenizer_type = training_config["tokenizer_type"].as<std::string>(config.tokenizer_type);
+    config.warmup_steps = training_config["warmup_steps"].as<uint32_t>(config.warmup_steps);
 
     return config;
 }
@@ -248,50 +259,51 @@ inline bool is_pipeline_parallel_enabled(const MultihostConfig &config) {
     return config.pipeline_parallel_config.has_value();
 }
 
-inline int get_mpi_rank_or_zero() {
-    auto &ctx = ttml::autograd::ctx();
-    auto distributed_ctx = ctx.get_distributed_context();
-    return distributed_ctx ? *distributed_ctx->rank() : 0;
-}
+// inline int get_mpi_rank_or_zero() {
+//     auto &ctx = ttml::autograd::ctx();
+//     auto distributed_ctx = ctx.get_distributed_context();
+//     return distributed_ctx ? *distributed_ctx->rank() : 0;
+// }
 
 inline bool is_three_tier_training(const MultihostConfig &config) {
     return config.enable_mpi && !is_pipeline_parallel_enabled(config);
 }
 
-inline bool is_last_pipeline_stage(const MultihostConfig &config) {
-    if (!is_pipeline_parallel_enabled(config)) {
-        return true;
-    }
-    return static_cast<unsigned>(get_mpi_rank_or_zero()) == (config.num_mh_workers - 1U);
-}
+// inline bool is_last_pipeline_stage(const MultihostConfig &config) {
+//     if (!is_pipeline_parallel_enabled(config)) {
+//         return true;
+//     }
+//     return static_cast<unsigned>(get_mpi_rank_or_zero()) == (config.num_mh_workers - 1U);
+// }
 
-inline bool pipeline_needs_to_call_loss(const MultihostConfig &config) {
-    return !is_pipeline_parallel_enabled(config) || is_last_pipeline_stage(config);
-}
+// inline bool pipeline_needs_to_call_loss(const MultihostConfig &config) {
+//     return !is_pipeline_parallel_enabled(config) || is_last_pipeline_stage(config);
+// }
 
-inline void pipeline_transfer_targets_if_needed(const MultihostConfig &config, const TensorPtr &target) {
-    if (!is_pipeline_parallel_enabled(config)) {
-        return;
-    }
-    if (config.num_mh_workers <= 1U) {
-        return;
-    }
-    auto &ctx = ttml::autograd::ctx();
-    auto distributed_ctx = ctx.get_distributed_context();
-    int rank = *distributed_ctx->rank();
-    auto &socket_manager = ctx.get_socket_manager();
-    if (rank == 0) {
-        socket_manager.send(
-            target->get_value(), distributed_ctx, ttml::core::distributed::Rank(config.num_mh_workers - 1));
-    } else if (static_cast<unsigned>(rank + 1U) == config.num_mh_workers) {
-        target->set_value(socket_manager.recv(target->get_value(), distributed_ctx, ttml::core::distributed::Rank(0)));
-    }
-}
+// inline void pipeline_transfer_targets_if_needed(const MultihostConfig &config, const TensorPtr &target) {
+//     if (!is_pipeline_parallel_enabled(config)) {
+//         return;
+//     }
+//     if (config.num_mh_workers <= 1U) {
+//         return;
+//     }
+//     auto &ctx = ttml::autograd::ctx();
+//     auto distributed_ctx = ctx.get_distributed_context();
+//     int rank = *distributed_ctx->rank();
+//     auto &socket_manager = ctx.get_socket_manager();
+//     if (rank == 0) {
+//         socket_manager.send(
+//             target->get_value(), distributed_ctx, ttml::core::distributed::Rank(config.num_mh_workers - 1));
+//     } else if (static_cast<unsigned>(rank + 1U) == config.num_mh_workers) {
+//         target->set_value(socket_manager.recv(target->get_value(), distributed_ctx,
+//         ttml::core::distributed::Rank(0)));
+//     }
+// }
 
 }  // namespace
 
 int main(int argc, char **argv) {
-    auto start_timer = std::chrono::high_resolution_clock::now();
+    // auto start_timer = std::chrono::high_resolution_clock::now();
     CLI::App app{"NanoGPT Example"};
     argv = app.ensure_utf8(argv);
 
@@ -314,7 +326,13 @@ int main(int argc, char **argv) {
         ->default_val(save_and_exit_path);
     app.add_option("--safetensors", safetensors_path, "Loads safetensors model from the given path")
         ->default_val(safetensors_path);
+    std::string csv_path = "training_log.csv";
+    std::string run_label = "adamw_1dev";
+    app.add_option("--csv", csv_path, "Path to CSV output file")->default_val(csv_path);
+    app.add_option("--run-label", run_label, "Label for this run (column in CSV)")->default_val(run_label);
     CLI11_PARSE(app, argc, argv);
+
+    CSVLogger csv_logger(csv_path, run_label);
 
     auto yaml_config = YAML::LoadFile(training_config_name);
 
@@ -509,7 +527,7 @@ int main(int argc, char **argv) {
             return std::make_tuple(data_tensor, targets_tensor, cached_data.masks_tensor);
         };
 
-    LossAverageMeter loss_meter;
+    // LossAverageMeter loss_meter;
     auto train_dataloader =
         DataLoader(dataset, /* batch_size */ training_config.batch_size, /* shuffle */ true, collate_fn);
 
@@ -582,6 +600,16 @@ int main(int argc, char **argv) {
     adamw_params.weight_decay = training_config.weight_decay;
     adamw_params.use_kahan_summation = training_config.use_kahan_summation;
 
+    auto sgd_params = ttml::optimizers::SGDConfig();
+    sgd_params.lr = training_config.learning_rate;
+    sgd_params.weight_decay = training_config.weight_decay;
+    sgd_params.momentum = training_config.momentum;
+
+    auto sgd_fused_params = ttml::optimizers::SGDFusedConfig();
+    sgd_fused_params.lr = training_config.learning_rate;
+    sgd_fused_params.weight_decay = training_config.weight_decay;
+    sgd_fused_params.momentum = training_config.momentum;
+
     if (training_config.use_no_op) {
         fmt::print("WARNING: Using NoOp optimizer - parameters will NOT be updated.\n");
     } else if (!is_three_tier_training(multihost_config)) {
@@ -595,10 +623,9 @@ int main(int argc, char **argv) {
 
     fmt::print("Number of parameters: {}\n", get_number_of_parameters(model, device_config.enable_tp));
 
-    auto select_optimizer = [&model,
-                             &adamw_params,
-                             &training_config,
-                             &multihost_config]() -> std::unique_ptr<ttml::optimizers::OptimizerBase> {
+    auto select_optimizer =
+        [&model, &adamw_params, &sgd_params, &sgd_fused_params, &training_config, &multihost_config]()
+        -> std::unique_ptr<ttml::optimizers::OptimizerBase> {
         if (is_three_tier_training(multihost_config)) {
             return std::make_unique<ttml::optimizers::RemoteOptimizer>(
                 get_model_parameters(model), multihost_config.num_mh_workers);
@@ -606,12 +633,18 @@ int main(int argc, char **argv) {
             return std::make_unique<ttml::optimizers::NoOp>(get_model_parameters(model));
         } else if (training_config.use_moreh_adamw) {
             return std::make_unique<ttml::optimizers::MorehAdamW>(get_model_parameters(model), adamw_params);
+        } else if (training_config.use_sgd) {
+            return std::make_unique<ttml::optimizers::SGD>(get_model_parameters(model), sgd_params);
+        } else if (training_config.use_sgd_fused) {
+            return std::make_unique<ttml::optimizers::SGDFused>(get_model_parameters(model), sgd_fused_params);
         } else {
             return std::make_unique<ttml::optimizers::AdamW>(get_model_parameters(model), adamw_params);
         }
     };
 
     auto optimizer = select_optimizer();
+    // fmt::println("ptio {}:", optimizer);
+
     auto scheduler = schedule_func(optimizer.get(), training_config.max_steps);
 
     if (is_three_tier_training(multihost_config)) {
@@ -665,43 +698,58 @@ int main(int argc, char **argv) {
     const uint32_t num_epochs = training_config.num_epochs;
     auto gradient_accumulator_helper = GradientAccumulator(training_config.gradient_accumulation_steps);
 
-    bool is_everything_compiled = false;
-    auto memory_snapshot = [&is_everything_compiled](const std::string &name) {
-        if (!is_everything_compiled) {
-            ttml::utils::MemoryUsageTracker::snapshot(name);
+    // bool is_everything_compiled = false;
+    // auto memory_snapshot = [&is_everything_compiled](const std::string &name) {
+    //     if (!is_everything_compiled) {
+    //         ttml::utils::MemoryUsageTracker::snapshot(name);
+    //     }
+    // };
+
+    // const bool needs_to_call_loss = pipeline_needs_to_call_loss(multihost_config);
+
+    // WARMUP LOOP — runs a few steps to trigger JIT kernel compilation
+    // so that step timing in the CSV reflects steady-state performance.
+    if (training_config.warmup_steps > 0) {
+        fmt::print("Running {} warmup step(s) (JIT compile)...\n", training_config.warmup_steps);
+        uint32_t warmup_done = 0;
+        for (auto [features, target, masks] : train_dataloader) {
+            optimizer->zero_grad();
+            auto output = run_model(model, features, masks);
+            auto loss = ttml::ops::cross_entropy_loss(output, target);
+            loss->backward();
+            ttml::autograd::ctx().reset_graph();
+            if (device_config.enable_ddp) {
+                ttml::core::distributed::synchronize_gradients(get_model_parameters(model));
+            }
+            device->quiesce_devices();
+            optimizer->step();
+            device->quiesce_devices();
+            warmup_done++;
+            fmt::print("  warmup {}/{}\n", warmup_done, training_config.warmup_steps);
+            if (warmup_done >= training_config.warmup_steps)
+                break;
         }
-    };
+        // Reset optimizer step count so CSV steps start from 1
+        optimizer->set_steps(0);
+        optimizer->zero_grad();
+        fmt::print("Warmup done. Starting timed training.\n");
+    }
 
-    const bool needs_to_call_loss = pipeline_needs_to_call_loss(multihost_config);
+    // TRAINING LOOP
 
-    // Training loop
     for (uint32_t epoch = 0; epoch < num_epochs; ++epoch) {
         for (auto [features, target, masks] : train_dataloader) {
-            ttml::autograd::ctx().get_profiler().read_results(device, "dataloader_step_done");
-
-            // TODO(rfurko): add mask sending, once mask becomes non-constant
-            pipeline_transfer_targets_if_needed(multihost_config, target);
-
-            auto start_timer = std::chrono::high_resolution_clock::now();
             if (gradient_accumulator_helper.should_zero_grad()) {
                 optimizer->zero_grad();
             }
-            auto output = run_model(model, features, masks);
-            float loss_float = 0.0F;
-            if (needs_to_call_loss) {
-                auto loss = ttml::ops::cross_entropy_loss(output, target);
-                loss = gradient_accumulator_helper.scale(loss);
-                loss_float = get_loss_value(loss);
-                ttml::autograd::ctx().get_profiler().read_results(device, "model_forward_done");
 
-                memory_snapshot("FORWARD_PASS");
-                loss->backward();
-                memory_snapshot("BACKWARD_PASS");
-            } else {
-                memory_snapshot("FORWARD_PASS");
-                output->backward();
-                memory_snapshot("BACKWARD_PASS");
-            }
+            auto step_start = std::chrono::high_resolution_clock::now();
+
+            auto output = run_model(model, features, masks);
+            auto loss = ttml::ops::cross_entropy_loss(output, target);
+            loss = gradient_accumulator_helper.scale(loss);
+            float loss_float = get_loss_value(loss);
+            loss->backward();
 
             ttml::autograd::ctx().reset_graph();
 
@@ -709,89 +757,40 @@ int main(int argc, char **argv) {
             gradient_accumulator_helper.update(loss_float, samples);
 
             if (gradient_accumulator_helper.should_step()) {
-                // synchronize gradients for multi-device case, no-op if single device
-                auto parameters = get_model_parameters(model);
-                if (device_config.enable_ddp && !is_three_tier_training(multihost_config)) {
-                    ttml::core::distributed::synchronize_gradients(parameters);
+                if (device_config.enable_ddp) {
+                    ttml::core::distributed::synchronize_gradients(get_model_parameters(model));
                 }
-
-                if (training_config.use_clip_grad_norm) {
-                    if (device_config.enable_tp) {
-                        throw std::logic_error("Clip grad norm is not supported with TP");
-                    }
-                    ttml::core::clip_grad_norm(parameters, training_config.clip_grad_norm_max_norm);
-                }
+                device->quiesce_devices();
+                auto opt_start = std::chrono::high_resolution_clock::now();
                 optimizer->step();
-                scheduler->step();
+                scheduler->step();  // running on hist or device? modify learning rates
+
+                device->quiesce_devices();
+                auto opt_end = std::chrono::high_resolution_clock::now();
+
+                auto step_end = std::chrono::high_resolution_clock::now();
+                auto step_ms =
+                    std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start).count() / 1000.0;
+                auto opt_ms =
+                    std::chrono::duration_cast<std::chrono::microseconds>(opt_end - opt_start).count() / 1000.0;
+
                 auto global_step = optimizer->get_steps();
-                if (needs_to_call_loss) {
-                    if (multihost_config.enable_mpi) {
-                        fmt::print("[Rank {}] ", *ttml::autograd::ctx().get_distributed_context()->rank());
-                    }
-                    fmt::print("Step: {}, Loss: {}\n", global_step, gradient_accumulator_helper.average_loss());
-                }
-                loss_meter.update(gradient_accumulator_helper.average_loss());
+                float avg_loss = gradient_accumulator_helper.average_loss();
 
-                if (!multihost_config.enable_mpi) {
-                    // save training state if it's not 3 tier training
-                    if (!model_config.model_path.empty() && global_step % training_config.model_save_interval == 0) {
-                        save_training_state(
-                            model_config.model_path, model, scheduler, model_config.model_type, optimizer->get_name());
-                    }
-                }
-
-                ttml::autograd::ctx().get_profiler().read_results(device, fmt::format("iteration_{}", global_step));
-
-                if (global_step >= training_config.max_steps) {
-                    break;
-                }
+                fmt::print("Step: {}, Loss: {}, Step: {} ms, Opt: {} ms\n", global_step, avg_loss, step_ms, opt_ms);
+                csv_logger.log(global_step, step_ms, opt_ms, avg_loss);
 
                 gradient_accumulator_helper.reset();
 
-                if (!is_everything_compiled) {
-                    ttml::autograd::ctx().get_profiler().read_results(device, "compilation_finished");
-                    is_everything_compiled = true;
-                    ttml::utils::MemoryUsageTracker::end_capture("FIRST_ITERATION_COMPLETE");
-                    ttml::utils::MemoryUsageTracker::print_memory_usage();
-                    ttml::utils::MemoryUsageTracker::clear();
-                }
-            }
-            auto end_timer = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_timer - start_timer).count();
-            if (needs_to_call_loss) {
-                fmt::print(
-                    "Full step time {} ms, cache entries: {}\n",
-                    (double)duration / 1000,
-                    device->num_program_cache_entries());
+                if (global_step >= training_config.max_steps)
+                    break;
             }
         }
-        if (optimizer->get_steps() >= training_config.max_steps) {
+        if (optimizer->get_steps() >= training_config.max_steps)
             break;
-        }
     }
 
-    if (!multihost_config.enable_mpi) {
-        // save training state if it's not 3 tier training
-        if (!model_config.model_path.empty()) {
-            save_training_state(
-                model_config.model_path, model, scheduler, model_config.model_type, optimizer->get_name());
-        }
-    }
-
-    auto end_timer = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_timer - start_timer).count();
-    fmt::print(
-        "{} Steps training time: {} s, cache entries: {}\n",
-        training_config.max_steps,
-        (double)duration / 1000000.,
-        device->num_program_cache_entries());
-
-    if (multihost_config.enable_mpi) {
-        auto &ctx = ttml::autograd::ctx();
-        auto distributed_ctx = ctx.get_distributed_context();
-        distributed_ctx->barrier();
-        fmt::print("Rank {}: Finalizing MPI context\n", distributed_ctx->rank());
-    }
+    ttml::autograd::ctx().close_device();
 
     ttml::autograd::ctx().get_profiler().read_results(device, "before close device", 0);
     ttml::autograd::ctx().close_device();
