@@ -28,6 +28,7 @@ COLORS = [
     "#16a34a",  # green
     "#d97706",  # amber
     "#7c3aed",  # violet
+    "#0891b2",  # cyan
 ]
 
 
@@ -48,7 +49,9 @@ def main():
     parser = argparse.ArgumentParser(description="Plot TT-Metal nano_gpt training metrics")
     parser.add_argument("--csv", nargs="+", default=["training_log.csv"])
     parser.add_argument("--output", default="training_plots.html")
+    parser.add_argument("--title", default="TT-Metal — Optimizer Comparison")
     parser.add_argument("--smooth-window", type=int, default=10)
+    parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--time-budget", type=float, default=None)
     parser.add_argument("--target-loss", type=float, default=None)
     args = parser.parse_args()
@@ -64,14 +67,15 @@ def main():
 
     fig = make_subplots(
         rows=1,
-        cols=4,
+        cols=5,
         subplot_titles=[
             "Loss vs Step",
             "Loss vs Wall-Clock Time",
             "Full Step Time",
             "Optimizer Step Time",
+            "Tokens / sec",
         ],
-        horizontal_spacing=0.07,
+        horizontal_spacing=0.06,
     )
 
     for i, run in enumerate(runs):
@@ -80,6 +84,7 @@ def main():
         loss_smooth = smooth(rdf["train_loss"], args.smooth_window)
         step_smooth = smooth(rdf["step_time_ms"], args.smooth_window)
         opt_smooth = smooth(rdf["optimizer_time_ms"], args.smooth_window)
+        tok_smooth = smooth(rdf["tokens_per_sec"], args.smooth_window) if "tokens_per_sec" in rdf.columns else None
 
         show_legend = True  # only first trace per run shows in legend
 
@@ -207,6 +212,38 @@ def main():
             col=4,
         )
 
+        # ── Plot 5: Tokens / sec ────────────────────────────────────────────
+        if tok_smooth is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=rdf["step"],
+                    y=rdf["tokens_per_sec"],
+                    mode="lines",
+                    name=run,
+                    legendgroup=run,
+                    line=dict(color=color, width=0.5),
+                    opacity=0.3,
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=5,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=rdf["step"],
+                    y=tok_smooth,
+                    mode="lines",
+                    name=run,
+                    legendgroup=run,
+                    line=dict(color=color, width=2),
+                    showlegend=False,
+                    hovertemplate=f"<b>{run}</b><br>step=%{{x}}<br>tok/s=%{{y:.0f}}<extra></extra>",
+                ),
+                row=1,
+                col=5,
+            )
+
     # ── Reference lines ─────────────────────────────────────────────────────
     if args.target_loss is not None:
         for col in [1, 2]:
@@ -228,11 +265,11 @@ def main():
             col=2,
         )
 
-    # Compilation warmup band on the timing plots
-    for col in [3, 4]:
+    # Compilation warmup band on the timing and throughput plots
+    for col in [3, 4, 5]:
         fig.add_vrect(
             x0=0,
-            x1=5,
+            x1=args.warmup_steps,
             fillcolor="orange",
             opacity=0.1,
             line_width=0,
@@ -247,16 +284,18 @@ def main():
     fig.update_xaxes(title_text="Wall-Clock Time (s)", row=1, col=2)
     fig.update_xaxes(title_text="Optimizer Step", row=1, col=3)
     fig.update_xaxes(title_text="Optimizer Step", row=1, col=4)
+    fig.update_xaxes(title_text="Optimizer Step", row=1, col=5)
 
     fig.update_yaxes(title_text="Train Loss", row=1, col=1)
     fig.update_yaxes(title_text="Train Loss", row=1, col=2)
     fig.update_yaxes(title_text="Time (ms)", row=1, col=3)
     fig.update_yaxes(title_text="Time (ms)", row=1, col=4)
+    fig.update_yaxes(title_text="Tokens / sec", row=1, col=5)
 
     fig.update_layout(
-        title=dict(text="TT-Metal nano_gpt — Optimizer Comparison", font=dict(size=15)),
+        title=dict(text=args.title, font=dict(size=15)),
         height=500,
-        width=1400,
+        width=1750,
         legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0),
         hovermode="x unified",
         template="plotly_white",
@@ -274,18 +313,23 @@ def main():
         total_steps = rdf["step"].max()
         total_time = rdf["wall_time_s"].max()
         final_loss = rdf["train_loss"].iloc[-1]
+        w = args.warmup_steps
+        steady = rdf[rdf["step"] > w]
         median_step_ms = rdf["step_time_ms"].median()
-        steady_step_ms = rdf[rdf["step"] > 5]["step_time_ms"].median()
+        steady_step_ms = steady["step_time_ms"].median()
         median_opt_ms = rdf["optimizer_time_ms"].median()
-        steady_opt_ms = rdf[rdf["step"] > 5]["optimizer_time_ms"].median()
+        steady_opt_ms = steady["optimizer_time_ms"].median()
         print(f"  [{run}]")
         print(f"    Steps:              {total_steps}")
         print(f"    Total wall time:    {total_time:.1f}s  ({total_time/60:.1f}min)")
         print(f"    Final train loss:   {final_loss:.4f}")
         print(f"    Median step time:   {median_step_ms:.1f}ms  (all steps)")
-        print(f"    Steady step time:   {steady_step_ms:.1f}ms  (steps > 5, post-compile)")
+        print(f"    Steady step time:   {steady_step_ms:.1f}ms  (steps > {w}, post-compile)")
         print(f"    Median opt time:    {median_opt_ms:.1f}ms  (all steps)")
-        print(f"    Steady opt time:    {steady_opt_ms:.1f}ms  (steps > 5, post-compile)")
+        print(f"    Steady opt time:    {steady_opt_ms:.1f}ms  (steps > {w}, post-compile)")
+        if "tokens_per_sec" in rdf.columns:
+            steady_tok = steady["tokens_per_sec"].median()
+            print(f"    Steady tok/sec:     {steady_tok:.0f}  (steps > {w}, post-compile)")
         if args.target_loss is not None:
             loss_smooth = smooth(rdf["train_loss"])
             crossed = rdf[loss_smooth <= args.target_loss]

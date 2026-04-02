@@ -4,7 +4,7 @@ training_config:
   model_save_interval: 500
   batch_size: 8
   num_epochs: 1
-  max_steps: 2000
+  max_steps: 3000
   use_clip_grad_norm: false
   clip_grad_norm_max_norm: 1.0
   warmup_steps: 50
@@ -12,10 +12,12 @@ training_config:
   tokenizer_type: "bpe"
   data_path: "data/tinyllama_wikitext103.yaml"
   optimizer:
-    type: MuonComposite
-    lr: 0.01
-    momentum: 0.95
-    ns_steps: 5
+    type: AdamWFullPrecision
+    lr: 0.0003
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+    weight_decay: 0.01
 
 device_config:
   enable_ddp: false

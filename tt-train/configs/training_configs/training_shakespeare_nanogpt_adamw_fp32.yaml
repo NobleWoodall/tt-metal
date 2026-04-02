@@ -18,7 +18,7 @@ training_config:
   data_path: "data/shakespeare.txt"
   model_config: "configs/model_configs/nanogpt.yaml"
   optimizer:
-    type: AdamW
+    type: AdamWFullPrecision
     lr: 0.0003
     weight_decay: 0.1
 

@@ -22,16 +22,17 @@ public:
         }
         // Write header only for new files
         if (!exists || std::filesystem::file_size(path_) == 0) {
-            file_ << "run_label,step,wall_time_s,step_time_ms,optimizer_time_ms,train_loss\n";
+            file_ << "run_label,step,wall_time_s,step_time_ms,optimizer_time_ms,train_loss,tokens_per_sec\n";
             file_.flush();
         }
     }
 
     // Call once per optimizer step (i.e. after scheduler->step())
-    void log(uint32_t step, double step_time_ms, double optimizer_time_ms, float train_loss) {
+    void log(
+        uint32_t step, double step_time_ms, double optimizer_time_ms, float train_loss, double tokens_per_sec = 0.0) {
         double wall_s = elapsed_seconds();
         file_ << run_label_ << "," << step << "," << wall_s << "," << step_time_ms << "," << optimizer_time_ms << ","
-              << train_loss << "\n";
+              << train_loss << "," << tokens_per_sec << "\n";
         file_.flush();  // flush every row so you can tail -f during a run
     }
 

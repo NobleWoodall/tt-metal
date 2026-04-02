@@ -872,8 +872,15 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                fmt::print("Step: {}, Loss: {}, Step: {} ms, Opt: {} ms\n", global_step, avg_loss, step_ms, opt_ms);
-                csv_logger.log(global_step, step_ms, opt_ms, avg_loss);
+                double tokens_per_sec = (training_config.batch_size * sequence_length) / (step_ms / 1000.0);
+                fmt::print(
+                    "Step: {}, Loss: {}, Step: {} ms, Opt: {} ms, Tok/s: {:.0f}\n",
+                    global_step,
+                    avg_loss,
+                    step_ms,
+                    opt_ms,
+                    tokens_per_sec);
+                csv_logger.log(global_step, step_ms, opt_ms, avg_loss, tokens_per_sec);
 
                 gradient_accumulator_helper.reset();
 

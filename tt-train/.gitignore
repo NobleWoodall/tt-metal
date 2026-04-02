@@ -45,3 +45,7 @@ venv/
 .envrc
 
 cluster_descriptor.yaml
+
+# Generated plot files
+*.html
+*.png
