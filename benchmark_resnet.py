@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import csv
+import statistics
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -27,7 +28,7 @@ import torch
 import torchvision
 
 import ttnn
-from models.demos.ttnn_resnet.tests.common.resnet50_test_infra import create_test_infra
+from models.demos.vision.classification.resnet50.ttnn_resnet.tests.common.resnet50_test_infra import create_test_infra
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@ DEFAULT_BATCH_SIZES = [16, 32]
 DEFAULT_FIDELITIES = ["LoFi", "HiFi2"]
 DEFAULT_RUNS = 10  # inference runs after warmup
 DEFAULT_WARMUP_RUNS = 2  # runs to discard before measuring
+DEFAULT_NUM_BATCHES = 50  # distinct random batches to pre-generate
 DEFAULT_OUTPUT_DIR = "generated/benchmarks/resnet50"
 
 
@@ -84,6 +86,7 @@ def run_one(
     act_dtype=ttnn.bfloat8_b,
     num_runs: int = DEFAULT_RUNS,
     num_warmup: int = DEFAULT_WARMUP_RUNS,
+    num_batches: int = DEFAULT_NUM_BATCHES,
 ) -> BenchmarkResult:
     num_devices = device.get_num_devices()
     fidelity = FIDELITY_MAP[fidelity_name]
@@ -110,12 +113,24 @@ def run_one(
         final_output_mem_config=ttnn.L1_MEMORY_CONFIG,
         model_location_generator=None,
     )
-    tt_inputs_host, input_mem_config = test_infra.setup_l1_sharded_input(device)
+    # Pre-generate distinct random batches (not included in timing)
+    print(f"  pre-generating {num_batches} random batches ...", flush=True)
+    input_batches = []
+    input_mem_config = None
+    for _ in range(num_batches):
+        torch_batch = torch.rand(total_batch, 3, 224, 224)
+        tt_host, mem_cfg = test_infra.setup_l1_sharded_input(device, torch_batch)
+        input_batches.append(tt_host)
+        input_mem_config = mem_cfg
     ttnn.synchronize_device(device)
     result.init_time_s = time.perf_counter() - t0
 
+    batch_idx = 0
+
     def single_run():
-        test_infra.input_tensor = tt_inputs_host.to(device, input_mem_config)
+        nonlocal batch_idx
+        test_infra.input_tensor = input_batches[batch_idx % num_batches].to(device, input_mem_config)
+        batch_idx += 1
         out = test_infra.run()
         ttnn.synchronize_device(device)
         _ = ttnn.to_torch(out, mesh_composer=test_infra.output_mesh_composer)
@@ -138,8 +153,6 @@ def run_one(
         t0 = time.perf_counter()
         single_run()
         latencies.append((time.perf_counter() - t0) * 1e3)  # ms
-
-    import statistics
 
     result.mean_latency_ms = statistics.mean(latencies)
     result.std_latency_ms = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
@@ -235,6 +248,9 @@ def parse_args():
     p.add_argument("--fidelities", nargs="+", default=DEFAULT_FIDELITIES, choices=list(FIDELITY_MAP.keys()))
     p.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="Measurement runs after warmup")
     p.add_argument("--warmup", type=int, default=DEFAULT_WARMUP_RUNS)
+    p.add_argument(
+        "--num-batches", type=int, default=DEFAULT_NUM_BATCHES, help="Distinct random batches to pre-generate"
+    )
     p.add_argument("--output", type=str, default=DEFAULT_OUTPUT_DIR, help="Output directory for CSV and plots")
     return p.parse_args()
 
@@ -261,6 +277,7 @@ def main():
                 fidelity_name=fidelity,
                 num_runs=args.runs,
                 num_warmup=args.warmup,
+                num_batches=args.num_batches,
             )
             print(f"  init        {r.init_time_s:.2f}s")
             print(f"  compile     {r.compile_time_s:.2f}s")

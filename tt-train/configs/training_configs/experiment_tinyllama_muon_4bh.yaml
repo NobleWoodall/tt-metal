@@ -1,0 +1,26 @@
+training_config:
+  project_name: "muon_experiment_tinyllama"
+  seed: 5489
+  batch_size: 32          # per optimizer step; DDP shards across 4 devices → 8 per device
+  gradient_accumulation_steps: 1
+  max_steps: 2000
+  eval_every: 200
+  tokenizer_type: "char"
+  data_path: "${TT_METAL_RUNTIME_ROOT}/tt-train/data/tinyllama_wikitext103.yaml"
+  model_config: "${TT_METAL_RUNTIME_ROOT}/tt-train/configs/model_configs/tinyllama.yaml"
+  optimizer:
+    type: MuonWithAdamW
+    # NOTE: verify these match your Llama param names via optimizer.print_param_groups()
+    # Common Llama C++ param name patterns — adjust if routing looks wrong.
+    adamw_modules: [tok_emb, tok_embeddings, pos_emb, output, fc, norm]
+    muon:
+      lr: 0.01
+      momentum: 0.95
+      ns_steps: 5
+    adamw:
+      lr: 0.0003
+      weight_decay: 0.01
+
+device_config:
+  enable_ddp: true
+  mesh_shape: [1, 4]

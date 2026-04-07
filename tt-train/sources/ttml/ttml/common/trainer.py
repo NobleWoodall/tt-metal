@@ -3,6 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Training loop and batch preparation for transformer models."""
+import csv
+import time
+from pathlib import Path
+
 import numpy as np
 import ttnn
 import ttml
@@ -10,9 +14,55 @@ from ttml.common.data import get_batch, build_causal_mask
 from tqdm import tqdm
 
 
-def get_batch_ttml(
-    ids: np.ndarray, seq_len: int, batch_size: int, use_ddp: bool = False
-):
+class CSVLogger:
+    """Logs per-step training metrics in the same format as csv_logger.hpp.
+
+    Columns: run_label, step, wall_time_s, step_time_ms, optimizer_time_ms,
+             train_loss, tokens_per_sec
+
+    Multiple runs can be appended to the same file and plotted together with
+    plot_training.py.
+    """
+
+    def __init__(self, path: str, run_label: str):
+        self.run_label = run_label
+        self.wall_start = time.time()
+        write_header = not Path(path).exists() or Path(path).stat().st_size == 0
+        self._f = open(path, "a", newline="")
+        self._w = csv.writer(self._f)
+        if write_header:
+            self._w.writerow(
+                [
+                    "run_label",
+                    "step",
+                    "wall_time_s",
+                    "step_time_ms",
+                    "optimizer_time_ms",
+                    "train_loss",
+                    "tokens_per_sec",
+                ]
+            )
+            self._f.flush()
+
+    def log(self, step: int, step_ms: float, opt_ms: float, loss: float, tokens_per_sec: float):
+        self._w.writerow(
+            [
+                self.run_label,
+                step,
+                round(time.time() - self.wall_start, 3),
+                round(step_ms, 3),
+                round(opt_ms, 3),
+                round(loss, 6),
+                round(tokens_per_sec, 1),
+            ]
+        )
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
+
+
+def get_batch_ttml(ids: np.ndarray, seq_len: int, batch_size: int, use_ddp: bool = False):
     """Prepare a batch of data for TTML training.
 
     Args:
@@ -36,18 +86,14 @@ def get_batch_ttml(
             ttnn.DataType.UINT32,
             mapper,
         )
-        tt_y = ttml.autograd.Tensor.from_numpy(
-            y_u32, ttnn.Layout.ROW_MAJOR, ttnn.DataType.UINT32, mapper
-        )
+        tt_y = ttml.autograd.Tensor.from_numpy(y_u32, ttnn.Layout.ROW_MAJOR, ttnn.DataType.UINT32, mapper)
     else:
         tt_x = ttml.autograd.Tensor.from_numpy(
             x_u32.reshape(batch_size, 1, 1, seq_len),
             ttnn.Layout.ROW_MAJOR,
             ttnn.DataType.UINT32,
         )
-        tt_y = ttml.autograd.Tensor.from_numpy(
-            y_u32, ttnn.Layout.ROW_MAJOR, ttnn.DataType.UINT32
-        )
+        tt_y = ttml.autograd.Tensor.from_numpy(y_u32, ttnn.Layout.ROW_MAJOR, ttnn.DataType.UINT32)
     return tt_x, tt_y
 
 
@@ -58,6 +104,7 @@ def train(
     train_ids: np.ndarray,
     use_ddp: bool = False,
     use_tp: bool = False,
+    csv_logger: CSVLogger = None,
 ):
     """Execute training loop.
 
@@ -99,6 +146,8 @@ def train(
         optim.zero_grad()
         accum_loss = 0.0
 
+        step_start = time.perf_counter()
+
         # Inner loop for gradient accumulation
         for _ in range(cfg.gradient_accumulation_steps):
             tt_x, tt_y = get_batch_ttml(train_ids, cfg.seq_len, cfg.batch_size, use_ddp)
@@ -125,10 +174,18 @@ def train(
         if use_ddp:
             ttml.core.distributed.synchronize_gradients(model.parameters())
 
+        opt_start = time.perf_counter()
         optim.step()
+        opt_ms = (time.perf_counter() - opt_start) * 1000.0
+
+        step_ms = (time.perf_counter() - step_start) * 1000.0
+        tokens_per_sec = (cfg.batch_size * cfg.seq_len * cfg.gradient_accumulation_steps) / (step_ms / 1000.0)
 
         # Record accumulated loss
         train_losses.append(accum_loss)
+
+        if csv_logger is not None:
+            csv_logger.log(step, step_ms, opt_ms, accum_loss, tokens_per_sec)
 
         # Update progress bar - preserve val_loss if it exists
         postfix = {"train_loss": f"{accum_loss:.4f}"}
@@ -144,9 +201,7 @@ def train(
             last_val_loss = val_losses[-1]
             model.train()
             # Update bar with validation loss
-            postfix = {
-                "train_loss": f"{train_losses[-1]:.4f}" if train_losses else "N/A"
-            }
+            postfix = {"train_loss": f"{train_losses[-1]:.4f}" if train_losses else "N/A"}
             postfix["val_loss"] = f"{last_val_loss:.4f}"
             bar.set_postfix(postfix, refresh=False)
 

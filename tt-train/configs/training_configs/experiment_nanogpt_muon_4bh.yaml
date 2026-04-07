@@ -1,0 +1,24 @@
+training_config:
+  project_name: "muon_experiment_nanogpt"
+  seed: 5489
+  batch_size: 64          # per optimizer step; DDP shards across 4 devices → 16 per device
+  gradient_accumulation_steps: 1
+  max_steps: 2000
+  eval_every: 200
+  tokenizer_type: "char"
+  data_path: "${TT_METAL_RUNTIME_ROOT}/tt-train/data/shakespeare.txt"
+  model_config: "${TT_METAL_RUNTIME_ROOT}/tt-train/configs/model_configs/nanogpt.yaml"
+  optimizer:
+    type: MuonWithAdamW
+    adamw_modules: [tok_emb, pos_emb, fc, kv_linear, qkv_linear]
+    muon:
+      lr: 0.01
+      momentum: 0.95
+      ns_steps: 5
+    adamw:
+      lr: 0.0003
+      weight_decay: 0.01
+
+device_config:
+  enable_ddp: true
+  mesh_shape: [1, 4]
