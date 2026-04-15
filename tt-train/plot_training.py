@@ -50,6 +50,7 @@ def main():
     parser.add_argument("--csv", nargs="+", default=["training_log.csv"])
     parser.add_argument("--output", default="training_plots.html")
     parser.add_argument("--title", default="TT-Metal — Optimizer Comparison")
+    parser.add_argument("--runs", nargs="+", default=None, help="Whitelist of run_label values to plot (default: all)")
     parser.add_argument("--smooth-window", type=int, default=10)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--time-budget", type=float, default=None)
@@ -62,6 +63,8 @@ def main():
         sys.exit(1)
 
     df = load_csvs(args.csv)
+    if args.runs:
+        df = df[df["run_label"].isin(args.runs)]
     runs = df["run_label"].unique()
     print(f"Loaded {len(df)} rows across {len(runs)} run(s): {list(runs)}")
 

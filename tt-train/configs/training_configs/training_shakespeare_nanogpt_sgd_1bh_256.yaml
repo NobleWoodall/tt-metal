@@ -2,9 +2,9 @@ training_config:
   project_name: "tt_train_nano_gpt"
   seed: 5489
   model_save_interval: 100
-  batch_size: 64
+  batch_size: 256           # weak-scaling baseline: 1 BH, 256 per device
   num_epochs: 1
-  max_steps: 2000
+  max_steps: 1000
   learning_rate: 0.05
   weight_decay: 0.0001
   momentum: 0.9
